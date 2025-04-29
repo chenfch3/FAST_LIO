@@ -24,6 +24,7 @@
 #include <geometry_msgs/Vector3.h>
 #include "use-ikfom.hpp"
 #include "preprocess.h"
+#include <geometry_msgs/PoseStamped.h>
 
 /// *************Preconfiguration
 
@@ -51,6 +52,7 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+  void PublishImuOdom(const state_ikfom &state, const ros::Time &stamp);
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -61,6 +63,10 @@ class ImuProcess
   V3D cov_bias_acc;
   double first_lidar_time;
   int lidar_type;
+  // Add these new members
+  ros::Publisher pub_imu_odom;
+  std::mutex mtx_imu_odom;
+  nav_msgs::Odometry imu_odom_msg;
 
  private:
   void IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N);
@@ -99,6 +105,10 @@ ImuProcess::ImuProcess()
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::Imu());
+
+  // Initialize IMU odometry message
+  imu_odom_msg.header.frame_id = "camera_init";
+  imu_odom_msg.child_frame_id = "base_link_lidar";
 }
 
 ImuProcess::~ImuProcess() {}
@@ -283,6 +293,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
     kf_state.predict(dt, Q, in);
 
+    /* Publish IMU odometry here */
+    if (pub_imu_odom.getNumSubscribers() > 0) 
+    {
+      imu_state = kf_state.get_x();
+      PublishImuOdom(imu_state, (*it_imu)->header.stamp);
+    }
+
     /* save the poses at each IMU measurements */
     imu_state = kf_state.get_x();
     angvel_last = angvel_avr - imu_state.bg;
@@ -385,4 +402,49 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   t3 = omp_get_wtime();
   
   // cout<<"[ IMU Process ]: Time: "<<t3 - t1<<endl;
+}
+
+void ImuProcess::PublishImuOdom(const state_ikfom &state, const ros::Time &stamp)
+{
+  std::lock_guard<std::mutex> lock(mtx_imu_odom);
+    
+  imu_odom_msg.header.stamp = stamp;
+  
+  // Position
+  imu_odom_msg.pose.pose.position.x = state.pos(0);
+  imu_odom_msg.pose.pose.position.y = state.pos(1);
+  imu_odom_msg.pose.pose.position.z = state.pos(2);
+  
+  // Orientation (convert from Eigen quaternion)
+  Eigen::Quaterniond q(state.rot);
+  imu_odom_msg.pose.pose.orientation.x = q.x();
+  imu_odom_msg.pose.pose.orientation.y = q.y();
+  imu_odom_msg.pose.pose.orientation.z = q.z();
+  imu_odom_msg.pose.pose.orientation.w = q.w();
+  
+  // Velocity
+  imu_odom_msg.twist.twist.linear.x = state.vel(0);
+  imu_odom_msg.twist.twist.linear.y = state.vel(1);
+  imu_odom_msg.twist.twist.linear.z = state.vel(2);
+  
+  // Publish
+  pub_imu_odom.publish(imu_odom_msg);
+
+  // 6. 广播TF变换
+  static tf::TransformBroadcaster tf_broadcaster;
+  tf::Transform transform;
+  transform.setOrigin(tf::Vector3(
+    state.pos(0), 
+    state.pos(1), 
+    state.pos(2)
+  ));
+  tf::Quaternion tf_q;
+  tf_q.setX(q.x());
+  tf_q.setY(q.y());
+  tf_q.setZ(q.z());
+  tf_q.setW(q.w());
+  transform.setRotation(tf_q);
+  tf_broadcaster.sendTransform(
+    tf::StampedTransform(transform, stamp, "camera_init", "base_link_lidar")
+  );
 }
